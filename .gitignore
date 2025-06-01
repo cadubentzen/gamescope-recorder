@@ -1,0 +1,6 @@
+/target
+/vendor
+*.h264
+*.png
+*.mp4
+*.nv12

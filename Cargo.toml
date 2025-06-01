@@ -1,0 +1,14 @@
+[package]
+name = "gamescope-recorder"
+version = "0.1.0"
+edition = "2021"
+authors = ["Carlos Bentzen <cadubentzen@igalia.com>"]
+
+[dependencies]
+cros-codecs = { git = "https://github.com/cadubentzen/cros-codecs.git", branch = "steam-deck", features = ["vaapi"] }
+cros-libva = { git = "https://github.com/cadubentzen/cros-libva.git", branch = "steam-deck", package = "cros-libva", default-features = false, features = []}
+pipewire = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "steam-deck", package = "pipewire" }
+libspa = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "steam-deck", package = "libspa" }
+anyhow = "1.0"
+nix = "0.29.0"
+
