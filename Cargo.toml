@@ -11,4 +11,5 @@ pipewire = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "s
 libspa = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "steam-deck", package = "libspa" }
 anyhow = "1.0"
 nix = "0.29.0"
+ctrlc = "3.4.7"
 

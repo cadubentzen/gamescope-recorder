@@ -1,9 +1,8 @@
-use std::{borrow::Borrow, rc::Rc};
+use std::{borrow::Borrow, fs::File, rc::Rc};
 
 use anyhow::Result;
 
 use cros_codecs::{
-    BlockingMode, FrameLayout, PlaneLayout, Resolution,
     backend::vaapi::{
         encoder::VaapiBackend,
         surface_pool::{PooledVaSurface, VaSurfacePool},
@@ -11,12 +10,13 @@ use cros_codecs::{
     codec::h264::parser::{Level, Profile},
     decoder::FramePool,
     encoder::{
-        FrameMetadata, PredictionStructure, Tunings, VideoEncoder,
         h264::{EncoderConfig, H264},
         stateless::StatelessEncoder,
+        FrameMetadata, PredictionStructure, Tunings, VideoEncoder,
     },
     libva::{Surface, UsageHint, VA_RT_FORMAT_YUV420},
-    video_frame::{generic_dma_video_frame::GenericDmaVideoFrame},
+    video_frame::generic_dma_video_frame::GenericDmaVideoFrame,
+    BlockingMode, FrameLayout, PlaneLayout, Resolution,
 };
 
 pub struct Encoder {
@@ -37,7 +37,7 @@ impl Encoder {
             level: Level::L4_1,
             pred_structure: PredictionStructure::LowDelay { limit: 240 }, // Every 4s for 60fps
             initial_tunings: Tunings {
-                rate_control: cros_codecs::encoder::RateControl::ConstantBitrate(3_000_000),
+                rate_control: cros_codecs::encoder::RateControl::ConstantBitrate(4_000_000),
                 framerate,
                 min_quality: 0,
                 max_quality: u32::MAX,
@@ -91,12 +91,15 @@ impl Encoder {
         })
     }
 
-    pub fn encode(&mut self, frame: GenericDmaVideoFrame) -> Result<()> {
+    pub fn encode(&mut self, dmabuf: &File) -> Result<()> {
         let pooled_surface = self
             .pool
             .get_surface()
             .expect("Failed to get surface from pool");
 
+        let frame =
+            GenericDmaVideoFrame::new(vec![dmabuf.try_clone().unwrap()], self.frame_layout.clone())
+                .unwrap();
         let surface: &Surface<()> = pooled_surface.borrow();
         frame.copy_to_surface(surface, &self.display).unwrap();
 
