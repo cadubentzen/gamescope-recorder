@@ -62,7 +62,7 @@ impl Encoder {
         };
         let coded_size = cros_codecs::Resolution { width, height };
         let low_power = false;
-        let blocking_mode = BlockingMode::Blocking;
+        let blocking_mode = BlockingMode::NonBlocking;
         let encoder = StatelessEncoder::<H264, _, _>::new_native_vaapi(
             display.clone(),
             config,
