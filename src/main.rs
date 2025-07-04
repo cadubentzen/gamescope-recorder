@@ -76,6 +76,10 @@ fn main() -> anyhow::Result<()> {
         let now = Instant::now();
         if next_frame_time >= now {
             thread::sleep(next_frame_time - now);
+            next_frame_time += frame_duration;
+        } else {
+            // If we are behind schedule, skip to the next frame time
+            next_frame_time = now + frame_duration;
         }
         next_frame_time += frame_duration;
     }
