@@ -6,8 +6,12 @@ use std::{
 };
 
 use anyhow::Result;
-use libspa::{self as spa, pod::Pod};
-use pipewire::{self as pw, properties::properties};
+use libspa::{
+    self as spa,
+    pod::{ChoiceValue, Pod, Property, Value},
+    utils::{Choice, ChoiceEnum, ChoiceFlags},
+};
+use pipewire::{self as pw, main_loop, properties::properties};
 
 #[allow(dead_code)]
 struct UserData {
@@ -16,32 +20,34 @@ struct UserData {
     last_frame: Option<i32>,
 }
 
+struct Terminate;
+
 #[allow(dead_code)]
 pub struct Capturer {
-    capture_thread: std::thread::JoinHandle<anyhow::Result<()>>,
+    capture_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     user_data: Arc<Mutex<UserData>>,
+    pw_sender: pw::channel::Sender<Terminate>,
 }
 
 impl Capturer {
-    pub fn new() -> Result<Self>
-// where
-// F: FnMut(spa::param::video::VideoInfoRaw, pw::buffer::Buffer) + 'static,
-    {
+    pub fn new() -> Result<Self> {
         let user_data = Arc::new(Mutex::new(UserData {
             format: Default::default(),
             dmabufs: HashMap::new(),
             last_frame: None,
         }));
+        let (pw_sender, pw_receiver) = pw::channel::channel();
         let capture_thread = std::thread::spawn::<_, Result<()>>({
             let user_data = user_data.clone();
             move || {
-                println!("Starting capture thread...");
-                let main_loop = pw::main_loop::MainLoop::new(None)?;
-                println!("Main loop created");
+                let main_loop = main_loop::MainLoop::new(None)?;
                 let context = pw::context::Context::new(&main_loop)?;
-                println!("Context created");
                 let core = context.connect(None)?;
-                println!("Connected to PipeWire core");
+
+                let _receiver = pw_receiver.attach(main_loop.loop_(), {
+                    let main_loop = main_loop.clone();
+                    move |_| main_loop.quit()
+                });
 
                 let props = properties! {
                     *pw::keys::MEDIA_TYPE => "Video",
@@ -50,16 +56,15 @@ impl Capturer {
                     *pw::keys::NODE_NAME => "gamescope",
                 };
 
-                println!("Creating stream with properties: {:?}", props);
                 let stream = pw::stream::Stream::new(&core, "zeroscope", props)?;
 
-                let listener = stream
+                let _listener = stream
                     .add_local_listener_with_user_data(user_data.clone())
-                    .state_changed(|_, _, old_state, new_state| {
-                        println!("State changed: {:?} -> {:?}", old_state, new_state);
+                    .state_changed(|_, _, _old_state, _new_state| {
+                        // println!("State changed: {:?} -> {:?}", old_state, new_state);
                     })
                     .param_changed(|_, user_data, id, param| {
-                        println!("Param changed: id = {}", id);
+                        // println!("Param changed: id = {}", id);
                         let Some(param) = param else {
                             return;
                         };
@@ -110,6 +115,9 @@ impl Capturer {
                                 return;
                             }
                             let data = &mut datas[0];
+                            // FIXME: this is fine if we're the only client capturing DMABUFs. However, if there are multiple clients, we should
+                            // copy it into another surface right away, otherwise we risk failing the import the dmabuf later on if it's
+                            // been reused/release by another client. To reproduce this, try to run this client alongside the Steam recorder.
                             let fd = RawFd::from(data.fd().unwrap() as i32);
                             if !user_data.dmabufs.contains_key(&fd) {
                                 let file = unsafe { File::from_raw_fd(fd) };
@@ -176,10 +184,32 @@ impl Capturer {
                             num: 1000,
                             denom: 1
                         }
-                    )
+                    ),
+                    // FIXME: implement enums for color structs and use property! macro
+                    Property::new(
+                        pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
+                        Value::Choice(ChoiceValue::Id(Choice(
+                            ChoiceFlags::_FAKE,
+                            ChoiceEnum::Enum {
+                                // Full color range
+                                default: pw::spa::utils::Id(1),
+                                alternatives: vec![pw::spa::utils::Id(1)],
+                            },
+                        ))),
+                    ),
+                    Property::new(
+                        pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
+                        Value::Choice(ChoiceValue::Id(Choice(
+                            ChoiceFlags::_FAKE,
+                            ChoiceEnum::Enum {
+                                // BT.709
+                                default: pw::spa::utils::Id(3),
+                                alternatives: vec![pw::spa::utils::Id(3)],
+                            },
+                        ))),
+                    ),
                 );
 
-                println!("Serializing pod object: {:?}", obj);
                 let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
                     std::io::Cursor::new(Vec::new()),
                     &pw::spa::pod::Value::Object(obj),
@@ -190,7 +220,6 @@ impl Capturer {
 
                 let mut params = [Pod::from_bytes(&values).unwrap()];
 
-                println!("Connecting stream");
                 stream.connect(
                     spa::utils::Direction::Input,
                     None,
@@ -198,7 +227,6 @@ impl Capturer {
                     &mut params,
                 )?;
 
-                println!("Stream connected. Running main loop...");
                 main_loop.run();
 
                 Ok(())
@@ -210,8 +238,9 @@ impl Capturer {
         }
 
         Ok(Self {
-            capture_thread,
+            capture_thread: Some(capture_thread),
             user_data,
+            pw_sender,
         })
     }
 
@@ -219,7 +248,14 @@ impl Capturer {
         let user_data = self.user_data.lock().unwrap();
         user_data
             .last_frame
-            .and_then(|_| Some(FrameGuard { user_data }))
+            .and_then(|_fd| Some(FrameGuard { user_data }))
+    }
+}
+
+impl Drop for Capturer {
+    fn drop(&mut self) {
+        self.pw_sender.send(Terminate).ok();
+        self.capture_thread.take().unwrap().join().ok();
     }
 }
 
