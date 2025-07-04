@@ -5,11 +5,32 @@ edition = "2021"
 authors = ["Carlos Bentzen <cadubentzen@igalia.com>"]
 
 [dependencies]
-cros-codecs = { git = "https://github.com/cadubentzen/cros-codecs.git", branch = "steam-deck", features = ["vaapi"] }
-cros-libva = { git = "https://github.com/cadubentzen/cros-libva.git", branch = "steam-deck", package = "cros-libva", default-features = false, features = []}
+cros-codecs = { git = "https://github.com/cadubentzen/cros-codecs.git", branch = "steam-deck", features = [
+    "vaapi",
+] }
+cros-libva = { git = "https://github.com/cadubentzen/cros-libva.git", branch = "steam-deck", package = "cros-libva", default-features = false, features = [
+] }
 pipewire = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "steam-deck", package = "pipewire" }
 libspa = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "steam-deck", package = "libspa" }
 anyhow = "1.0"
-nix = "0.29.0"
 ctrlc = "3.4.7"
+libc = "0.2.174"
+memmap2 = "0.9.5"
 
+[patch.crates-io.pipewire]
+path = "/home/cadubentzen/pipewire-rs/pipewire"
+
+[patch.crates-io.pipewire-sys]
+path = "/home/cadubentzen/pipewire-rs/pipewire-sys"
+
+[patch.crates-io.libspa]
+path = "/home/cadubentzen/pipewire-rs/libspa"
+
+[patch.crates-io.libspa-sys]
+path = "/home/cadubentzen/pipewire-rs/libspa-sys"
+
+[patch.crates-io.cros-codecs]
+path = "/home/cadubentzen/cros-codecs"
+
+[patch.crates-io.cros-libva]
+path = "/home/cadubentzen/cros-libva/lib"

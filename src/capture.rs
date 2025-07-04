@@ -1,40 +1,45 @@
 use std::{
-    collections::HashMap,
-    fs::File,
-    os::fd::{FromRawFd, RawFd},
     sync::{Arc, Mutex, MutexGuard},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use libspa::{
-    self as spa,
-    pod::{ChoiceValue, Pod, Property, Value},
-    utils::{Choice, ChoiceEnum, ChoiceFlags},
-};
+use libspa::{self as spa, pod::Pod};
 use pipewire::{self as pw, main_loop, properties::properties};
 
 #[allow(dead_code)]
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
-    dmabufs: HashMap<i32, File>,
-    last_frame: Option<i32>,
+    out_buffer: Vec<u8>,
+    last_frame_time: Option<Instant>,
+    config: CapturerConfig,
+}
+
+pub struct FrameGuard<'s> {
+    user_data: MutexGuard<'s, UserData>,
 }
 
 struct Terminate;
 
 #[allow(dead_code)]
 pub struct Capturer {
-    capture_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    capture_thread: Option<JoinHandle<anyhow::Result<()>>>,
     user_data: Arc<Mutex<UserData>>,
     pw_sender: pw::channel::Sender<Terminate>,
 }
 
+pub struct CapturerConfig {
+    pub frame_rate: u32,
+}
+
 impl Capturer {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: CapturerConfig) -> Result<Self> {
         let user_data = Arc::new(Mutex::new(UserData {
             format: Default::default(),
-            dmabufs: HashMap::new(),
-            last_frame: None,
+            out_buffer: Vec::new(),
+            last_frame_time: None,
+            config,
         }));
         let (pw_sender, pw_receiver) = pw::channel::channel();
         let capture_thread = std::thread::spawn::<_, Result<()>>({
@@ -60,11 +65,11 @@ impl Capturer {
 
                 let _listener = stream
                     .add_local_listener_with_user_data(user_data.clone())
-                    .state_changed(|_, _, _old_state, _new_state| {
-                        // println!("State changed: {:?} -> {:?}", old_state, new_state);
+                    .state_changed(|_, _, old_state, new_state| {
+                        println!("State changed: {old_state:?} -> {new_state:?}");
                     })
                     .param_changed(|_, user_data, id, param| {
-                        // println!("Param changed: id = {}", id);
+                        println!("Param changed: id = {id}");
                         let Some(param) = param else {
                             return;
                         };
@@ -109,26 +114,40 @@ impl Capturer {
                         None => println!("out of buffers"),
                         Some(mut buffer) => {
                             let mut user_data = user_data.lock().unwrap();
+
+                            if let Some(last_frame_time) = user_data.last_frame_time {
+                                // Evict old frame if older than half the frame duration
+                                let frame_timeout =
+                                    Duration::from_millis(500 / user_data.config.frame_rate as u64);
+                                if Instant::now() - last_frame_time < frame_timeout {
+                                    return;
+                                } else {
+                                    user_data.last_frame_time = Some(Instant::now());
+                                }
+                            }
+
                             let datas = buffer.datas_mut();
                             if datas.is_empty() {
                                 eprintln!("No data in pipewire buffer");
                                 return;
                             }
                             let data = &mut datas[0];
-                            // FIXME: this is fine if we're the only client capturing DMABUFs. However, if there are multiple clients, we should
-                            // copy it into another surface right away, otherwise we risk failing the import the dmabuf later on if it's
-                            // been reused/release by another client. To reproduce this, try to run this client alongside the Steam recorder.
-                            let fd = RawFd::from(data.fd().unwrap() as i32);
-                            if !user_data.dmabufs.contains_key(&fd) {
-                                let file = unsafe { File::from_raw_fd(fd) };
-                                user_data.dmabufs.insert(fd, file);
-                            }
-                            user_data.last_frame = Some(fd);
+                            assert!(
+                                data.type_() == pw::spa::buffer::DataType::MemFd,
+                                "Expected MemFd data type"
+                            );
+                            let fd = data.fd().unwrap();
+                            let mmap = unsafe {
+                                memmap2::Mmap::map(fd as i32)
+                                    .expect("Failed to map pipewire buffer to memory")
+                            };
+                            let size = data.chunk().size() as usize;
+                            user_data.out_buffer.resize(size, 0);
+                            user_data.out_buffer.copy_from_slice(&mmap[..size]);
                         }
                     })
                     .register()?;
 
-                // FIXME: use 2 params, with second as shm fallback
                 let obj = pw::spa::pod::object!(
                     pw::spa::utils::SpaTypes::ObjectParamFormat,
                     pw::spa::param::ParamType::EnumFormat,
@@ -145,15 +164,7 @@ impl Capturer {
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoFormat,
                         Id,
-                        pw::spa::param::video::VideoFormat::NV12
-                    ),
-                    // FIXME: modifier should have SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE props, but it works like that just
-                    // fine on Gamescope for now.
-                    // FIXME: use DRM_FORMAT_MOD_LINEAR here. Where can we find this constant in the Rust bindings?
-                    pw::spa::pod::property!(
-                        pw::spa::param::format::FormatProperties::VideoModifier,
-                        Long,
-                        0
+                        pw::spa::param::video::VideoFormat::BGRx
                     ),
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoSize,
@@ -184,29 +195,6 @@ impl Capturer {
                             num: 1000,
                             denom: 1
                         }
-                    ),
-                    // FIXME: implement enums for color structs and use property! macro
-                    Property::new(
-                        pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
-                        Value::Choice(ChoiceValue::Id(Choice(
-                            ChoiceFlags::_FAKE,
-                            ChoiceEnum::Enum {
-                                // Full color range
-                                default: pw::spa::utils::Id(1),
-                                alternatives: vec![pw::spa::utils::Id(1)],
-                            },
-                        ))),
-                    ),
-                    Property::new(
-                        pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
-                        Value::Choice(ChoiceValue::Id(Choice(
-                            ChoiceFlags::_FAKE,
-                            ChoiceEnum::Enum {
-                                // BT.709
-                                default: pw::spa::utils::Id(3),
-                                alternatives: vec![pw::spa::utils::Id(3)],
-                            },
-                        ))),
                     ),
                 );
 
@@ -245,10 +233,12 @@ impl Capturer {
     }
 
     pub fn last_frame(&self) -> Option<FrameGuard> {
-        let user_data = self.user_data.lock().unwrap();
-        user_data
-            .last_frame
-            .and_then(|_fd| Some(FrameGuard { user_data }))
+        let user_data: MutexGuard<UserData> = self.user_data.lock().unwrap();
+        if user_data.out_buffer.is_empty() {
+            None
+        } else {
+            Some(FrameGuard { user_data })
+        }
     }
 }
 
@@ -259,24 +249,8 @@ impl Drop for Capturer {
     }
 }
 
-pub struct FrameGuard<'s> {
-    user_data: MutexGuard<'s, UserData>,
-}
-
 impl<'s> FrameGuard<'s> {
-    pub fn width(&self) -> u32 {
-        self.user_data.format.size().width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.user_data.format.size().height
-    }
-
-    pub fn dmabuf(&self) -> &File {
-        // We check that last_frame is Some in Capturer::last_frame()
-        self.user_data
-            .dmabufs
-            .get(&self.user_data.last_frame.unwrap())
-            .unwrap()
+    pub fn data(&self) -> &[u8] {
+        &self.user_data.out_buffer
     }
 }

@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::Write,
-    os::fd::{FromRawFd, RawFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -12,21 +11,19 @@ use std::{
 use std::thread;
 use std::time::Duration;
 
-use cros_codecs::{
-    backend::vaapi::encoder, video_frame::generic_dma_video_frame::GenericDmaVideoFrame,
-};
-use nix::unistd::dup;
 
 mod capture;
 mod encode;
 
+use capture::{Capturer, CapturerConfig};
+
 const FPS: u32 = 60;
 
 fn main() -> anyhow::Result<()> {
-    let mut encoder: Option<encode::Encoder> = None;
-    let mut output_file = File::create("output.h264")?;
+    let encoder: Option<encode::Encoder> = None;
+    let mut output_file = File::create("output.bgrx")?;
 
-    let capturer = capture::Capturer::new()?;
+    let capturer = Capturer::new(CapturerConfig { frame_rate: FPS })?;
     let running = Arc::new(AtomicBool::new(true));
 
     ctrlc::set_handler({
@@ -38,38 +35,27 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Error setting Ctrl+C handler");
 
-    let mut frame_count = 0;
+    let mut captured_count = 0;
+    let encoded_count = 0;
+
     let frame_duration = Duration::from_secs_f64(1.0 / FPS as f64);
     let start = Instant::now();
     let mut next_frame_time = start + frame_duration;
     while running.load(Ordering::SeqCst) {
         // Get last frame from the capturer
         if let Some(frame) = capturer.last_frame() {
-            if encoder.is_none() {
-                encoder = Some(
-                    encode::Encoder::new(frame.width(), frame.height(), FPS)
-                        .expect("Failed to create encoder"),
-                );
+            captured_count += 1;
+            // Print progress every 60 frames
+            if captured_count % 60 == 0 {
+                print!(".");
+                std::io::stdout().flush().expect("Failed to flush stdout");
             }
-            // Encode the frame
-            let encoder = encoder.as_mut().unwrap();
-            encoder.encode(frame.dmabuf())?;
-        } else {
-            eprintln!("No frame captured");
-        }
 
-        // Write the encoded frame to the output file
-        if let Some(encoder) = &mut encoder {
-            while let Some(bitstream) = encoder.poll()? {
-                frame_count += 1;
-                if frame_count % 60 == 0 {
-                    print!(".");
-                    std::io::stdout().flush().expect("Failed to flush stdout");
-                }
-                output_file
-                    .write_all(&bitstream.bitstream)
-                    .expect("Failed to write to output file");
-            }
+            output_file
+                .write_all(frame.data())
+                .expect("Failed to write to output file");
+        } else {
+            eprintln!("No frame received, skipping...");
         }
 
         // Wait 1/60s-processing_time before capturing the next frame
@@ -81,7 +67,6 @@ fn main() -> anyhow::Result<()> {
             // If we are behind schedule, skip to the next frame time
             next_frame_time = now + frame_duration;
         }
-        next_frame_time += frame_duration;
     }
     // Drain the encoder and write any remaining frames to the output file
     println!("\nDraining encoder...");
