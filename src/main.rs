@@ -13,15 +13,14 @@ use std::time::Duration;
 
 
 mod capture;
-mod encode;
+// mod encode;
 
 use capture::{Capturer, CapturerConfig};
 
 const FPS: u32 = 60;
 
 fn main() -> anyhow::Result<()> {
-    let encoder: Option<encode::Encoder> = None;
-    let mut output_file = File::create("output.bgrx")?;
+    let mut output_file = File::create("output.nv12")?;
 
     let capturer = Capturer::new(CapturerConfig { frame_rate: FPS })?;
     let running = Arc::new(AtomicBool::new(true));
@@ -66,16 +65,6 @@ fn main() -> anyhow::Result<()> {
         } else {
             // If we are behind schedule, skip to the next frame time
             next_frame_time = now + frame_duration;
-        }
-    }
-    // Drain the encoder and write any remaining frames to the output file
-    println!("\nDraining encoder...");
-    if let Some(mut encoder) = encoder {
-        encoder.drain()?;
-        while let Some(bitstream) = encoder.poll()? {
-            output_file
-                .write_all(&bitstream.bitstream)
-                .expect("Failed to write to output file");
         }
     }
 

@@ -58,7 +58,6 @@ impl Capturer {
                     *pw::keys::MEDIA_TYPE => "Video",
                     *pw::keys::MEDIA_CATEGORY => "Capture",
                     *pw::keys::MEDIA_ROLE => "Screen",
-                    *pw::keys::NODE_NAME => "gamescope",
                 };
 
                 let stream = pw::stream::Stream::new(&core, "zeroscope", props)?;
@@ -164,7 +163,7 @@ impl Capturer {
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoFormat,
                         Id,
-                        pw::spa::param::video::VideoFormat::BGRx
+                        pw::spa::param::video::VideoFormat::NV12
                     ),
                     pw::spa::pod::property!(
                         pw::spa::param::format::FormatProperties::VideoSize,
@@ -210,7 +209,7 @@ impl Capturer {
 
                 stream.connect(
                     spa::utils::Direction::Input,
-                    None,
+                    Some(80),
                     pw::stream::StreamFlags::AUTOCONNECT,
                     &mut params,
                 )?;
