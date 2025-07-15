@@ -67,6 +67,7 @@ impl VppContext {
                 &mut context,
             )
         };
+        
         if ret != VA_STATUS_SUCCESS as i32 {
             bail!("Error creating VPP context: {ret:?}");
         }
@@ -112,6 +113,7 @@ impl VppBuffer {
                 &mut buffer,
             )
         };
+        
         if ret != VA_STATUS_SUCCESS as i32 {
             bail!("Error creating VPP buffer: {ret:?}");
         }
@@ -147,6 +149,7 @@ impl VaapiScaler {
 
     /// Scale a frame from source surface to destination surface
     pub fn scale(&self, src_surface: &Surface<()>, dst_surface: &Surface<()>) -> Result<()> {
+        
         // Create context for this specific scaling operation
         let render_targets = [dst_surface.id()];
         let context = VppContext::new(
@@ -192,7 +195,13 @@ impl VaapiScaler {
         // Perform the scaling operation
         unsafe {
             vaBeginPicture(self.display.handle(), context.id(), dst_surface.id());
+        }
+
+        unsafe {
             vaRenderPicture(self.display.handle(), context.id(), &mut pipeline_buf.id(), 1);
+        }
+
+        unsafe {
             vaEndPicture(self.display.handle(), context.id());
         }
 
@@ -202,9 +211,11 @@ impl VaapiScaler {
     /// Scale a frame and synchronize (wait for completion)
     pub fn scale_sync(&self, src_surface: &Surface<()>, dst_surface: &Surface<()>) -> Result<()> {
         self.scale(src_surface, dst_surface)?;
+        
         unsafe {
             vaSyncSurface(self.display.handle(), dst_surface.id());
         }
+        
         Ok(())
     }
 }

@@ -15,7 +15,7 @@ use cros_codecs::{
 use std::{
     borrow::Borrow,
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     time::Instant,
 };
 
@@ -68,6 +68,10 @@ struct Args {
     /// Maximum number of frames to process (optional, processes all frames if not specified)
     #[arg(long)]
     frames: Option<usize>,
+
+    /// Loop input file when reaching end (for continuous processing)
+    #[arg(long)]
+    loop_input: bool,
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -147,13 +151,17 @@ fn main() -> Result<()> {
     // Get file size and calculate total frames
     let file_size = input_file.metadata()?.len() as usize;
     let available_frames = file_size / input_frame_size;
-    let total_frames = args
-        .frames
-        .unwrap_or(available_frames)
-        .min(available_frames);
+    let total_frames = if args.loop_input {
+        args.frames.unwrap_or(usize::MAX) // Process indefinitely or until --frames limit
+    } else {
+        args.frames.unwrap_or(available_frames).min(available_frames)
+    };
     println!(
-        "Input file size: {} bytes, estimated frames: {}, processing: {}",
-        file_size, available_frames, total_frames
+        "Input file size: {} bytes, estimated frames: {}, processing: {}{}",
+        file_size, 
+        available_frames, 
+        if total_frames == usize::MAX { "indefinitely".to_string() } else { total_frames.to_string() },
+        if args.loop_input { " (looping)" } else { "" }
     );
 
     // Initialize VAAPI display
@@ -287,20 +295,44 @@ fn main() -> Result<()> {
     let mut total_upload_time = std::time::Duration::ZERO;
     let mut total_scale_time = std::time::Duration::ZERO;
     let mut total_download_time = std::time::Duration::ZERO;
+    let mut upload_times = Vec::new();
+    let mut scale_times = Vec::new();
+    let mut download_times = Vec::new();
+
+    // 60fps timing
+    let frame_duration = std::time::Duration::from_nanos(1_000_000_000 / 60); // 16.67ms per frame
+    let start_time = Instant::now();
 
     // Process each frame
     for frame_idx in 0..total_frames {
-        // Read one frame from file
+        let frame_start = Instant::now();
+        
+        // Read one frame from file with optional looping support
         match input_file.read_exact(&mut frame_buffer) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                println!("Reached end of file at frame {}", frame_idx);
-                break;
+                if args.loop_input {
+                    // Loop back to beginning of file
+                    if frame_idx % 60 == 0 {
+                        println!("Reached end of file, looping back to beginning");
+                    }
+                    input_file.seek(std::io::SeekFrom::Start(0))?;
+                    match input_file.read_exact(&mut frame_buffer) {
+                        Ok(_) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                } else {
+                    println!("Reached end of file at frame {}", frame_idx);
+                    break;
+                }
             }
             Err(e) => return Err(e.into()),
         }
 
-        println!("Processing frame {}/{}", frame_idx + 1, total_frames);
+        if frame_idx % 60 == 0 {
+            println!("Processing frame {}/{}", frame_idx + 1, 
+                if total_frames == usize::MAX { "∞".to_string() } else { total_frames.to_string() });
+        }
 
         // Get a surface from the input pool
         let src_pooled_surface = src_pool
@@ -319,6 +351,7 @@ fn main() -> Result<()> {
         )?;
         let upload_time = upload_start.elapsed();
         total_upload_time += upload_time;
+        upload_times.push(upload_time);
 
         // Get a surface from the output pool for the scaled output
         let dst_pooled_surface = dst_pool
@@ -334,6 +367,7 @@ fn main() -> Result<()> {
         }
         let scale_time = scale_start.elapsed();
         total_scale_time += scale_time;
+        scale_times.push(scale_time);
 
         match args.format {
             OutputFormat::H264 => {
@@ -372,13 +406,17 @@ fn main() -> Result<()> {
                     )?;
                     let download_time = download_start.elapsed();
                     total_download_time += download_time;
+                    download_times.push(download_time);
                     output_file.write_all(buf)?;
                 }
             }
         }
 
-        if frame_idx % 30 == 0 {
-            println!("Processed frame {}/{}", frame_idx + 1, total_frames);
+        
+        // Sleep to maintain 60fps timing, compensating for processing time
+        let frame_elapsed = frame_start.elapsed();
+        if frame_elapsed < frame_duration {
+            std::thread::sleep(frame_duration - frame_elapsed);
         }
     }
 
@@ -405,22 +443,66 @@ fn main() -> Result<()> {
     let frames_processed = total_frames;
     println!("\n=== Timing Summary ===");
     println!("Total frames processed: {}", frames_processed);
-    println!(
-        "Upload time:   {:.2}ms total, {:.3}ms avg per frame",
-        total_upload_time.as_secs_f64() * 1000.0,
-        total_upload_time.as_secs_f64() * 1000.0 / frames_processed as f64
-    );
-    println!(
-        "Scale time:    {:.2}ms total, {:.3}ms avg per frame",
-        total_scale_time.as_secs_f64() * 1000.0,
-        total_scale_time.as_secs_f64() * 1000.0 / frames_processed as f64
-    );
-    if matches!(args.format, OutputFormat::Nv12) {
-        println!(
-            "Download time: {:.2}ms total, {:.3}ms avg per frame",
-            total_download_time.as_secs_f64() * 1000.0,
-            total_download_time.as_secs_f64() * 1000.0 / frames_processed as f64
-        );
+    
+    // Helper function to calculate percentiles
+    fn calculate_percentile(mut times: Vec<std::time::Duration>, percentile: f64) -> f64 {
+        if times.is_empty() {
+            return 0.0;
+        }
+        times.sort();
+        let index = ((times.len() as f64 - 1.0) * percentile).round() as usize;
+        times[index.min(times.len() - 1)].as_secs_f64() * 1000.0
+    }
+    
+    // Upload timing
+    if !upload_times.is_empty() {
+        let first_frame = upload_times[0].as_secs_f64() * 1000.0;
+        let subsequent_times: Vec<_> = upload_times.iter().skip(1).cloned().collect();
+        
+        println!("\nUpload timing:");
+        println!("  First frame (cold start): {:.3}ms", first_frame);
+        if !subsequent_times.is_empty() {
+            println!("  Subsequent frames: {:.3}ms min, {:.3}ms max, {:.3}ms p50, {:.3}ms p95", 
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::INFINITY, f64::min),
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::NEG_INFINITY, f64::max),
+                calculate_percentile(subsequent_times.clone(), 0.5),
+                calculate_percentile(subsequent_times, 0.95)
+            );
+        }
+    }
+    
+    // Scale timing
+    if !scale_times.is_empty() {
+        let first_frame = scale_times[0].as_secs_f64() * 1000.0;
+        let subsequent_times: Vec<_> = scale_times.iter().skip(1).cloned().collect();
+        
+        println!("\nScale timing:");
+        println!("  First frame (cold start): {:.3}ms", first_frame);
+        if !subsequent_times.is_empty() {
+            println!("  Subsequent frames: {:.3}ms min, {:.3}ms max, {:.3}ms p50, {:.3}ms p95", 
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::INFINITY, f64::min),
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::NEG_INFINITY, f64::max),
+                calculate_percentile(subsequent_times.clone(), 0.5),
+                calculate_percentile(subsequent_times, 0.95)
+            );
+        }
+    }
+    
+    // Download timing (only for NV12 mode)
+    if matches!(args.format, OutputFormat::Nv12) && !download_times.is_empty() {
+        let first_frame = download_times[0].as_secs_f64() * 1000.0;
+        let subsequent_times: Vec<_> = download_times.iter().skip(1).cloned().collect();
+        
+        println!("\nDownload timing:");
+        println!("  First frame (cold start): {:.3}ms", first_frame);
+        if !subsequent_times.is_empty() {
+            println!("  Subsequent frames: {:.3}ms min, {:.3}ms max, {:.3}ms p50, {:.3}ms p95", 
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::INFINITY, f64::min),
+                subsequent_times.iter().map(|t| t.as_secs_f64() * 1000.0).fold(f64::NEG_INFINITY, f64::max),
+                calculate_percentile(subsequent_times.clone(), 0.5),
+                calculate_percentile(subsequent_times, 0.95)
+            );
+        }
     }
 
     Ok(())
