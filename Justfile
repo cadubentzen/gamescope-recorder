@@ -140,13 +140,17 @@ remote-encode: deploy
 
 # Run scale-sample on remote host (same as scale, default to 50 frames)
 remote-scale: deploy
-    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output {{cros_h264_file}} --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --bitrate {{bitrate}} --maxrate {{maxrate}} --rc-mode cbr --format h264 --frames 50"
+    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output {{cros_h264_file}} --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --bitrate {{bitrate}} --maxrate {{maxrate}} --rc-mode cbr --format h264 --loop-input"
+    rsync -avz --progress {{remote_host}}:{{remote_path}}/{{cros_h264_file}} ./remote_{{cros_h264_file}}
+    MP4Box -add remote_{{cros_h264_file}}:fps={{fps}} -new remote_{{cros_codecs_scaled_file}}
+
+download-remote-scale:
     rsync -avz --progress {{remote_host}}:{{remote_path}}/{{cros_h264_file}} ./remote_{{cros_h264_file}}
     MP4Box -add remote_{{cros_h264_file}}:fps={{fps}} -new remote_{{cros_codecs_scaled_file}}
 
 # Run scale-sample on remote host in NV12 mode (same as scale-nv12, default to 50 frames)
 remote-scale-nv12: deploy
-    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output scaled_output.nv12 --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --format nv12 --frames 50"
+    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output scaled_output.nv12 --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --format nv12 --frames 500"
     rsync -avz --progress {{remote_host}}:{{remote_path}}/scaled_output.nv12 ./remote_scaled_output.nv12
 
 # Play downloaded remote files
