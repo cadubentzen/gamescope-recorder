@@ -126,6 +126,8 @@ vmaf-ffmpeg-vaapi-cbr-no-idr:
 # Build binaries in release mode
 build:
     cargo build --release --bin encode-sample --bin scale-sample
+    patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 target/release/encode-sample
+    patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 target/release/scale-sample
 
 # Deploy binaries to remote host
 deploy: build
