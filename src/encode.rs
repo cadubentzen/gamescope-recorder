@@ -1,6 +1,6 @@
-use std::{borrow::Borrow, fs::File, rc::Rc};
+use std::{borrow::Borrow, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use cros_codecs::{
     backend::vaapi::{
@@ -15,12 +15,10 @@ use cros_codecs::{
         FrameMetadata, PredictionStructure, Tunings, VideoEncoder,
     },
     libva::{Surface, UsageHint, VA_RT_FORMAT_YUV420},
-    video_frame::generic_dma_video_frame::GenericDmaVideoFrame,
     BlockingMode, FrameLayout, PlaneLayout, Resolution,
 };
 
 pub struct Encoder {
-    display: Rc<cros_codecs::libva::Display>,
     encoder: StatelessEncoder<H264, PooledVaSurface<()>, VaapiBackend<(), PooledVaSurface<()>>>,
     pub frame_layout: FrameLayout,
     pool: VaSurfacePool<()>,
@@ -29,15 +27,18 @@ pub struct Encoder {
 
 impl Encoder {
     // FIXME: size changes will break this encoder
-    pub fn new(width: u32, height: u32, framerate: u32) -> Result<Self> {
-        let display = cros_codecs::libva::Display::open().expect("Failed to open VA display");
+    pub fn new(framerate: u32, first_frame: &Arc<PooledVaSurface<()>>) -> Result<Self> {
+        let surface: &Surface<()> = std::borrow::Borrow::borrow(first_frame.as_ref());
+        let width = surface.size().0;
+        let height = surface.size().1;
+        let display = surface.display().clone();
         let config = EncoderConfig {
             resolution: Resolution { width, height },
             profile: Profile::Main,
             level: Level::L4_1,
             pred_structure: PredictionStructure::LowDelay { limit: 240 }, // Every 4s for 60fps
             initial_tunings: Tunings {
-                rate_control: cros_codecs::encoder::RateControl::ConstantBitrate(4_000_000),
+                rate_control: cros_codecs::encoder::RateControl::ConstantBitrate(9_000_000),
                 framerate,
                 min_quality: 0,
                 max_quality: u32::MAX,
@@ -83,7 +84,6 @@ impl Encoder {
             .expect("Failed to add frames to pool");
 
         Ok(Encoder {
-            display: display.clone(),
             encoder,
             frame_layout: frame_layout.clone(),
             pool,
@@ -91,23 +91,20 @@ impl Encoder {
         })
     }
 
-    pub fn encode(&mut self, dmabuf: &File) -> Result<()> {
-        let pooled_surface = self
-            .pool
-            .get_surface()
-            .expect("Failed to get surface from pool");
-
-        let frame =
-            GenericDmaVideoFrame::new(vec![dmabuf.try_clone().unwrap()], self.frame_layout.clone())
-                .unwrap();
-        let surface: &Surface<()> = pooled_surface.borrow();
-        frame.copy_to_surface(surface, &self.display).unwrap();
-
+    pub fn encode(&mut self, input_surface: Arc<PooledVaSurface<()>>) -> Result<()> {
         let meta = FrameMetadata {
             timestamp: self.counter,
             layout: self.frame_layout.clone(),
             force_keyframe: false,
         };
+
+        let pooled_surface = self
+            .pool
+            .get_surface()
+            .expect("Failed to get surface from pool");
+        copy_surfaces(input_surface.as_ref().borrow(), pooled_surface.borrow())
+            .map_err(|e| anyhow!("{}", e))?;
+
         self.counter += 1;
         // FIXME: implement Error for EncodeError
         self.encoder
@@ -127,4 +124,109 @@ impl Encoder {
         let bitstream_buffer = self.encoder.poll().expect("Failed to poll encoder");
         Ok(bitstream_buffer)
     }
+}
+
+pub fn copy_surfaces(src_surface: &Surface<()>, dst_surface: &Surface<()>) -> Result<(), String> {
+    use cros_codecs::libva::{VAProfile::VAProfileNone, *};
+
+    // TODO: implement proper bindings in cros-libva
+    let mut vpp_config = Default::default();
+    let mut vpp_context = Default::default();
+
+    let raw_display = src_surface.display().handle();
+
+    let ret = unsafe {
+        vaCreateConfig(
+            raw_display,
+            VAProfileNone,
+            VAEntrypoint::VAEntrypointVideoProc,
+            std::ptr::null_mut(),
+            0,
+            &mut vpp_config,
+        )
+    };
+    if ret != VA_STATUS_SUCCESS as i32 {
+        return Err(format!("Error creating VPP config: {ret:?}"));
+    }
+
+    let ret = unsafe {
+        vaCreateContext(
+            raw_display,
+            vpp_config,
+            dst_surface.size().0 as i32,
+            dst_surface.size().1 as i32,
+            VA_PROGRESSIVE as i32,
+            &mut dst_surface.id(),
+            1,
+            &mut vpp_context,
+        )
+    };
+    if ret != VA_STATUS_SUCCESS as i32 {
+        unsafe { vaDestroyConfig(raw_display, vpp_config) };
+        return Err(format!("Error creating VPP context: {ret:?}"));
+    }
+
+    let pipeline_param = VAProcPipelineParameterBuffer {
+        surface: src_surface.id(),
+        ..Default::default()
+    };
+    let mut params = [pipeline_param];
+
+    let mut pipeline_buf = Default::default();
+    let ret = unsafe {
+        vaCreateBuffer(
+            raw_display,
+            vpp_context,
+            VABufferType::VAProcPipelineParameterBufferType,
+            std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
+            1,
+            params.as_mut_ptr() as *mut _,
+            &mut pipeline_buf,
+        )
+    };
+
+    if ret != VA_STATUS_SUCCESS as i32 {
+        unsafe {
+            vaDestroyContext(raw_display, vpp_context);
+            vaDestroyConfig(raw_display, vpp_config);
+        }
+        return Err(format!("Error creating VPP pipeline buffer: {ret:?}"));
+    }
+
+    unsafe {
+        vaBeginPicture(raw_display, vpp_context, dst_surface.id());
+        vaRenderPicture(raw_display, vpp_context, &mut pipeline_buf, 1);
+        vaEndPicture(raw_display, vpp_context);
+        vaSyncSurface(raw_display, dst_surface.id());
+
+        vaDestroyBuffer(raw_display, pipeline_buf);
+        vaDestroyContext(raw_display, vpp_context);
+        vaDestroyConfig(raw_display, vpp_config);
+    };
+
+    // TODO: detect and use vaCopy when possible instead as below, since it's faster.
+    // It doesn't work on AMD though.
+
+    // let mut dst_object = _VACopyObject {
+    //     obj_type: VACopyObjectType::VACopyObjectSurface,
+    //     object: _VACopyObject__bindgen_ty_1 { surface_id: dst_surface.id() },
+    //     ..Default::default()
+    // };
+    // let mut src_object = _VACopyObject {
+    //     obj_type: VACopyObjectType::VACopyObjectSurface,
+    //     object: _VACopyObject__bindgen_ty_1 { surface_id: src_surface.id() },
+    //     ..Default::default()
+    // };
+
+    // let ret = unsafe {
+    //     vaCopy(display.handle(), &mut dst_object, &mut src_object, Default::default())
+    // };
+
+    // if ret != VA_STATUS_SUCCESS as i32 {
+    //     return Err(format!("Error copying GenericDmaVideoFrame to VA-API surface: {ret:?}"));
+    // }
+
+    // unsafe { vaSyncSurface(display.handle(), dst_surface.id()) };
+
+    Ok(())
 }

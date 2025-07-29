@@ -1,11 +1,17 @@
 use std::{
-    collections::HashMap,
     fs::File,
-    os::fd::{FromRawFd, RawFd},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
 };
 
 use anyhow::Result;
+use cros_codecs::{
+    backend::vaapi::surface_pool::{PooledVaSurface, VaSurfacePool},
+    decoder::FramePool,
+    libva::{Display, UsageHint, VA_RT_FORMAT_YUV420},
+    video_frame::generic_dma_video_frame::GenericDmaVideoFrame,
+    Fourcc, FrameLayout, PlaneLayout, Resolution,
+};
 use libspa::{
     self as spa,
     pod::{ChoiceValue, Pod, Property, Value},
@@ -16,15 +22,15 @@ use pipewire::{self as pw, main_loop, properties::properties};
 #[allow(dead_code)]
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
-    dmabufs: HashMap<i32, File>,
-    last_frame: Option<i32>,
+    pool: Option<VaSurfacePool<()>>,
+    last_frame: Option<Arc<PooledVaSurface<()>>>,
 }
 
 struct Terminate;
 
 #[allow(dead_code)]
 pub struct Capturer {
-    capture_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    capture_thread: Option<JoinHandle<anyhow::Result<()>>>,
     user_data: Arc<Mutex<UserData>>,
     pw_sender: pw::channel::Sender<Terminate>,
 }
@@ -33,11 +39,11 @@ impl Capturer {
     pub fn new() -> Result<Self> {
         let user_data = Arc::new(Mutex::new(UserData {
             format: Default::default(),
-            dmabufs: HashMap::new(),
+            pool: None,
             last_frame: None,
         }));
         let (pw_sender, pw_receiver) = pw::channel::channel();
-        let capture_thread = std::thread::spawn::<_, Result<()>>({
+        let capture_thread = thread::spawn::<_, Result<()>>({
             let user_data = user_data.clone();
             move || {
                 let main_loop = main_loop::MainLoop::new(None)?;
@@ -53,18 +59,18 @@ impl Capturer {
                     *pw::keys::MEDIA_TYPE => "Video",
                     *pw::keys::MEDIA_CATEGORY => "Capture",
                     *pw::keys::MEDIA_ROLE => "Screen",
-                    *pw::keys::NODE_NAME => "gamescope",
+                    *pw::keys::TARGET_OBJECT => "gamescope",
                 };
 
                 let stream = pw::stream::Stream::new(&core, "zeroscope", props)?;
 
                 let _listener = stream
                     .add_local_listener_with_user_data(user_data.clone())
-                    .state_changed(|_, _, _old_state, _new_state| {
-                        // println!("State changed: {:?} -> {:?}", old_state, new_state);
+                    .state_changed(|_, _, old_state, new_state| {
+                        println!("State changed: {:?} -> {:?}", old_state, new_state);
                     })
                     .param_changed(|_, user_data, id, param| {
-                        // println!("Param changed: id = {}", id);
+                        println!("Param changed: id = {}", id);
                         let Some(param) = param else {
                             return;
                         };
@@ -82,6 +88,8 @@ impl Capturer {
                         {
                             return;
                         }
+
+                        println!("Got video format:");
 
                         let mut user_data = user_data.lock().unwrap();
                         user_data
@@ -104,26 +112,73 @@ impl Capturer {
                             user_data.format.framerate().num,
                             user_data.format.framerate().denom
                         );
+                        println!("  color_range: {:?}", user_data.format.color_range());
+                        println!("  color_matrix: {:?}", user_data.format.color_matrix());
+
+                        let display = Display::open().unwrap();
+                        let mut pool = VaSurfacePool::new(
+                            display.clone(),
+                            VA_RT_FORMAT_YUV420,
+                            Some(UsageHint::USAGE_HINT_ENCODER),
+                            Resolution {
+                                width: user_data.format.size().width,
+                                height: user_data.format.size().height,
+                            },
+                        );
+                        pool.add_frames(vec![(); 16])
+                            .expect("Failed to add frames to pool");
+                        user_data.pool = Some(pool);
                     })
                     .process(|stream, user_data| match stream.dequeue_buffer() {
                         None => println!("out of buffers"),
                         Some(mut buffer) => {
-                            let mut user_data = user_data.lock().unwrap();
                             let datas = buffer.datas_mut();
                             if datas.is_empty() {
                                 eprintln!("No data in pipewire buffer");
                                 return;
                             }
                             let data = &mut datas[0];
-                            // FIXME: this is fine if we're the only client capturing DMABUFs. However, if there are multiple clients, we should
-                            // copy it into another surface right away, otherwise we risk failing the import the dmabuf later on if it's
-                            // been reused/release by another client. To reproduce this, try to run this client alongside the Steam recorder.
-                            let fd = RawFd::from(data.fd().unwrap() as i32);
-                            if !user_data.dmabufs.contains_key(&fd) {
-                                let file = unsafe { File::from_raw_fd(fd) };
-                                user_data.dmabufs.insert(fd, file);
-                            }
-                            user_data.last_frame = Some(fd);
+                            let fd: std::os::unix::prelude::BorrowedFd<'_> =
+                                data.fd().expect("Failed to get fd from buffer data");
+                            let file = File::from(fd.try_clone_to_owned().unwrap());
+
+                            let mut user_data = user_data.lock().unwrap();
+
+                            let fourcc = Fourcc::from(b"NV12");
+                            let width = user_data.format.size().width;
+                            let height = user_data.format.size().height;
+                            let frame_layout = FrameLayout {
+                                format: (fourcc, 0),
+                                size: Resolution { width, height },
+                                planes: vec![
+                                    PlaneLayout {
+                                        buffer_index: 0,
+                                        offset: 0,
+                                        stride: width as usize,
+                                    },
+                                    PlaneLayout {
+                                        buffer_index: 0,
+                                        offset: width as usize * height as usize,
+                                        stride: width as usize,
+                                    },
+                                ],
+                            };
+
+                            let dma_frame = GenericDmaVideoFrame::new(vec![file], frame_layout)
+                                .expect("Failed to create GenericDmaVideoFrame");
+
+                            let pooled_surface = user_data
+                                .pool
+                                .as_mut()
+                                .unwrap()
+                                .get_surface()
+                                .expect("Failed to get surface from pool");
+
+                            dma_frame
+                                .copy_to_surface(std::borrow::Borrow::borrow(&pooled_surface))
+                                .unwrap();
+                            user_data.last_frame = Some(Arc::new(pooled_surface));
+                            // println!("Captured frame: {}x{}", width, height);
                         }
                     })
                     .register()?;
@@ -191,9 +246,9 @@ impl Capturer {
                         Value::Choice(ChoiceValue::Id(Choice(
                             ChoiceFlags::_FAKE,
                             ChoiceEnum::Enum {
-                                // Full color range
-                                default: pw::spa::utils::Id(1),
-                                alternatives: vec![pw::spa::utils::Id(1)],
+                                // Limited color range
+                                default: pw::spa::utils::Id(2),
+                                alternatives: vec![pw::spa::utils::Id(2)],
                             },
                         ))),
                     ),
@@ -244,11 +299,9 @@ impl Capturer {
         })
     }
 
-    pub fn last_frame(&self) -> Option<FrameGuard> {
+    pub fn read_frame(&self) -> Option<Arc<PooledVaSurface<()>>> {
         let user_data = self.user_data.lock().unwrap();
-        user_data
-            .last_frame
-            .and_then(|_fd| Some(FrameGuard { user_data }))
+        user_data.last_frame.clone()
     }
 }
 
@@ -256,27 +309,5 @@ impl Drop for Capturer {
     fn drop(&mut self) {
         self.pw_sender.send(Terminate).ok();
         self.capture_thread.take().unwrap().join().ok();
-    }
-}
-
-pub struct FrameGuard<'s> {
-    user_data: MutexGuard<'s, UserData>,
-}
-
-impl<'s> FrameGuard<'s> {
-    pub fn width(&self) -> u32 {
-        self.user_data.format.size().width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.user_data.format.size().height
-    }
-
-    pub fn dmabuf(&self) -> &File {
-        // We check that last_frame is Some in Capturer::last_frame()
-        self.user_data
-            .dmabufs
-            .get(&self.user_data.last_frame.unwrap())
-            .unwrap()
     }
 }
