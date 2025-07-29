@@ -13,6 +13,7 @@ use std::time::Duration;
 
 mod capture;
 mod encode;
+mod frame_buffer;
 
 use capture::Capturer;
 use encode::Encoder;
@@ -75,7 +76,6 @@ fn main() -> anyhow::Result<()> {
             // If we are behind schedule, skip to the next frame time
             next_frame_time = now + frame_duration;
         }
-        next_frame_time += frame_duration;
     }
     // Drain the encoder and write any remaining frames to the output file
     println!("\nDraining encoder...");

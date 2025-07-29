@@ -19,11 +19,13 @@ use libspa::{
 };
 use pipewire::{self as pw, main_loop, properties::properties};
 
+use crate::frame_buffer::FrameBuffer;
+
 #[allow(dead_code)]
 struct UserData {
-    format: spa::param::video::VideoInfoRaw,
-    pool: Option<VaSurfacePool<()>>,
-    last_frame: Option<Arc<PooledVaSurface<()>>>,
+    format: Mutex<spa::param::video::VideoInfoRaw>,
+    pool: Mutex<Option<VaSurfacePool<()>>>,
+    frame_buffer: FrameBuffer<PooledVaSurface<()>>,
 }
 
 struct Terminate;
@@ -31,17 +33,17 @@ struct Terminate;
 #[allow(dead_code)]
 pub struct Capturer {
     capture_thread: Option<JoinHandle<anyhow::Result<()>>>,
-    user_data: Arc<Mutex<UserData>>,
+    user_data: Arc<UserData>,
     pw_sender: pw::channel::Sender<Terminate>,
 }
 
 impl Capturer {
     pub fn new() -> Result<Self> {
-        let user_data = Arc::new(Mutex::new(UserData {
-            format: Default::default(),
-            pool: None,
-            last_frame: None,
-        }));
+        let user_data = Arc::new(UserData {
+            format: Mutex::new(Default::default()),
+            pool: Mutex::new(None),
+            frame_buffer: FrameBuffer::new(),
+        });
         let (pw_sender, pw_receiver) = pw::channel::channel();
         let capture_thread = thread::spawn::<_, Result<()>>({
             let user_data = user_data.clone();
@@ -91,29 +93,22 @@ impl Capturer {
 
                         println!("Got video format:");
 
-                        let mut user_data = user_data.lock().unwrap();
-                        user_data
-                            .format
-                            .parse(param)
-                            .expect("Failed to parse format");
+                        let mut format = user_data.format.lock().unwrap();
+                        format.parse(param).expect("Failed to parse format");
                         println!("got video format:");
                         println!(
                             "  format: {} ({:?})",
-                            user_data.format.format().as_raw(),
-                            user_data.format.format()
+                            format.format().as_raw(),
+                            format.format()
                         );
-                        println!(
-                            "  size: {}x{}",
-                            user_data.format.size().width,
-                            user_data.format.size().height
-                        );
+                        println!("  size: {}x{}", format.size().width, format.size().height);
                         println!(
                             "  framerate: {}/{}",
-                            user_data.format.framerate().num,
-                            user_data.format.framerate().denom
+                            format.framerate().num,
+                            format.framerate().denom
                         );
-                        println!("  color_range: {:?}", user_data.format.color_range());
-                        println!("  color_matrix: {:?}", user_data.format.color_matrix());
+                        println!("  color_range: {:?}", format.color_range());
+                        println!("  color_matrix: {:?}", format.color_matrix());
 
                         let display = Display::open().unwrap();
                         let mut pool = VaSurfacePool::new(
@@ -121,13 +116,13 @@ impl Capturer {
                             VA_RT_FORMAT_YUV420,
                             Some(UsageHint::USAGE_HINT_ENCODER),
                             Resolution {
-                                width: user_data.format.size().width,
-                                height: user_data.format.size().height,
+                                width: format.size().width,
+                                height: format.size().height,
                             },
                         );
                         pool.add_frames(vec![(); 16])
                             .expect("Failed to add frames to pool");
-                        user_data.pool = Some(pool);
+                        user_data.pool.lock().unwrap().replace(pool);
                     })
                     .process(|stream, user_data| match stream.dequeue_buffer() {
                         None => println!("out of buffers"),
@@ -142,11 +137,11 @@ impl Capturer {
                                 data.fd().expect("Failed to get fd from buffer data");
                             let file = File::from(fd.try_clone_to_owned().unwrap());
 
-                            let mut user_data = user_data.lock().unwrap();
-
                             let fourcc = Fourcc::from(b"NV12");
-                            let width = user_data.format.size().width;
-                            let height = user_data.format.size().height;
+                            let (width, height) = {
+                                let format = user_data.format.lock().unwrap().size();
+                                (format.width, format.height)
+                            };
                             let frame_layout = FrameLayout {
                                 format: (fourcc, 0),
                                 size: Resolution { width, height },
@@ -169,6 +164,8 @@ impl Capturer {
 
                             let pooled_surface = user_data
                                 .pool
+                                .lock()
+                                .unwrap()
                                 .as_mut()
                                 .unwrap()
                                 .get_surface()
@@ -177,7 +174,7 @@ impl Capturer {
                             dma_frame
                                 .copy_to_surface(std::borrow::Borrow::borrow(&pooled_surface))
                                 .unwrap();
-                            user_data.last_frame = Some(Arc::new(pooled_surface));
+                            user_data.frame_buffer.write(Arc::new(pooled_surface));
                             // println!("Captured frame: {}x{}", width, height);
                         }
                     })
@@ -300,8 +297,7 @@ impl Capturer {
     }
 
     pub fn read_frame(&self) -> Option<Arc<PooledVaSurface<()>>> {
-        let user_data = self.user_data.lock().unwrap();
-        user_data.last_frame.clone()
+        self.user_data.frame_buffer.read()
     }
 }
 
