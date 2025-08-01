@@ -114,7 +114,7 @@ impl Capturer {
                         let mut pool = VaSurfacePool::new(
                             display.clone(),
                             VA_RT_FORMAT_YUV420,
-                            Some(UsageHint::USAGE_HINT_ENCODER),
+                            Some(UsageHint::USAGE_HINT_VPP_WRITE | UsageHint::USAGE_HINT_VPP_READ),
                             Resolution {
                                 width: format.size().width,
                                 height: format.size().height,

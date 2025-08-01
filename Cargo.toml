@@ -12,4 +12,8 @@ libspa = { git = "https://github.com/cadubentzen/pipewire-rs.git", branch = "ste
 anyhow = "1.0"
 nix = "0.29.0"
 ctrlc = "3.4.7"
+rsmpeg = { git = "https://github.com/cadubentzen/rsmpeg.git", branch = "avcodeccontext-fields", features = [
+    "link_system_ffmpeg",
+    "ffmpeg7_1",
+] }
 

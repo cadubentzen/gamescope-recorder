@@ -13,12 +13,13 @@ use std::time::Duration;
 
 mod capture;
 mod encode;
+mod encode_ffmpeg;
 mod frame_buffer;
 
 use capture::Capturer;
-use encode::Encoder;
+use encode_ffmpeg::Encoder;
 
-const FPS: u32 = 60;
+const FPS: i32 = 60;
 
 fn main() -> anyhow::Result<()> {
     let mut encoder: Option<Encoder> = None;
@@ -55,15 +56,11 @@ fn main() -> anyhow::Result<()> {
 
         // Write the encoded frame to the output file
         if let Some(encoder) = &mut encoder {
-            while let Some(bitstream) = encoder.poll()? {
-                frame_count += 1;
-                if frame_count % 60 == 0 {
-                    print!(".");
-                    std::io::stdout().flush().expect("Failed to flush stdout");
-                }
-                output_file
-                    .write_all(&bitstream.bitstream)
-                    .expect("Failed to write to output file");
+            let num_frames = encoder.poll_write(&mut output_file)?;
+            frame_count += num_frames;
+            if frame_count % 60 == 0 {
+                print!(".");
+                std::io::stdout().flush().expect("Failed to flush stdout");
             }
         }
 
@@ -80,12 +77,7 @@ fn main() -> anyhow::Result<()> {
     // Drain the encoder and write any remaining frames to the output file
     println!("\nDraining encoder...");
     if let Some(mut encoder) = encoder {
-        encoder.drain()?;
-        while let Some(bitstream) = encoder.poll()? {
-            output_file
-                .write_all(&bitstream.bitstream)
-                .expect("Failed to write to output file");
-        }
+        encoder.drain_write(&mut output_file)?;
     }
 
     Ok(())

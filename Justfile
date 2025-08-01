@@ -125,40 +125,28 @@ vmaf-ffmpeg-vaapi-cbr-no-idr:
 
 # Build binaries in release mode
 build:
-    cargo build --release --bin encode-sample --bin scale-sample
+    cargo build --release
 
 # Deploy binaries to remote host
 deploy: build
     ssh {{remote_host}} "mkdir -p {{remote_path}}"
-    rsync -avz --progress target/release/encode-sample target/release/scale-sample {{remote_host}}:{{remote_path}}/
+    rsync -avz --progress target/release/gamescope-recorder {{remote_host}}:{{remote_path}}/
 
 # Run encode-sample on remote host (same as encode-cros-codecs, default to 50 frames)
-remote-encode: deploy
-    ssh {{remote_host}} "cd {{remote_path}} && ./encode-sample --input {{raw_file}} --output {{cros_h264_file}} --bitrate {{bitrate}} --maxrate {{maxrate}} --rc-mode cbr --frames 50"
-    rsync -avz --progress {{remote_host}}:{{remote_path}}/{{cros_h264_file}} ./remote_{{cros_h264_file}}
-    MP4Box -add remote_{{cros_h264_file}}:fps={{fps}} -new remote_{{cros_codecs_file}}
+remote-run: deploy
+    ssh {{remote_host}} "cd {{remote_path}} && XDG_RUNTIME_DIR=/run/user/1000 ./gamescope-recorder"
 
-# Run scale-sample on remote host (same as scale, default to 50 frames)
-remote-scale: deploy
-    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output {{cros_h264_file}} --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --bitrate {{bitrate}} --maxrate {{maxrate}} --rc-mode cbr --format h264 --loop-input"
-    rsync -avz --progress {{remote_host}}:{{remote_path}}/{{cros_h264_file}} ./remote_{{cros_h264_file}}
-    MP4Box -add remote_{{cros_h264_file}}:fps={{fps}} -new remote_{{cros_codecs_scaled_file}}
-
-download-remote-scale:
-    rsync -avz --progress {{remote_host}}:{{remote_path}}/{{cros_h264_file}} ./remote_{{cros_h264_file}}
-    MP4Box -add remote_{{cros_h264_file}}:fps={{fps}} -new remote_{{cros_codecs_scaled_file}}
-
-# Run scale-sample on remote host in NV12 mode (same as scale-nv12, default to 50 frames)
-remote-scale-nv12: deploy
-    ssh {{remote_host}} "cd {{remote_path}} && ./scale-sample --input {{raw_file}} --output scaled_output.nv12 --input-width {{input_width}} --input-height {{input_height}} --output-width {{output_width}} --output-height {{output_height}} --format nv12 --frames 500"
-    rsync -avz --progress {{remote_host}}:{{remote_path}}/scaled_output.nv12 ./remote_scaled_output.nv12
+remote-download:
+    rsync -avz --progress {{remote_host}}:{{remote_path}}/output.h264 ./remote_output.h264
+    MP4Box -add remote_output.h264:fps={{fps}} -new remote_output.mp4
 
 # Play downloaded remote files
-play-remote-encode:
-    ffplay remote_{{cros_codecs_file}}
+remote-play: remote-download
+    ffplay remote_output.mp4
 
-play-remote-scale:
-    ffplay remote_{{cros_codecs_scaled_file}}
+run:
+    cargo run --release
 
-play-remote-scale-nv12:
-    ffplay {{raw_scaled_input}} remote_scaled_output.nv12
+play-recorded:
+    MP4Box -add output.h264:fps={{fps}} -new output.mp4
+    ffplay output.mp4
